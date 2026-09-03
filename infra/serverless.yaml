@@ -1,0 +1,386 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  openminimax serverless API layer: HTTP API (the ONLY public surface, TLS) gated by a
+  Lambda authorizer that validates our self-signed keys, submit/poll integration
+  Lambda, two DynamoDB tables (keys + tasks) shared with the GPU-box worker, a
+  DynamoDB VPC gateway endpoint, and an EventBridge-scheduled autostop Lambda that
+  scales the GPU box to zero. Deploys on top of the base network/compute stack
+  (infra/template.yaml). See ../docs/PLAN.md §7.
+
+# SECURITY: the only internet-facing thing here is the HTTP API, and every route on
+# it requires the Lambda authorizer (a valid mmh3_ key) — there is no unauthenticated
+# route except a health check. SGLang and the GPU box remain private (base stack).
+# Admin key issuance is an IAM-gated CLI (app.admin_keys), NOT a public route.
+
+Parameters:
+  BaseStackName:
+    Type: String
+    Default: openminimax
+    Description: Name of the base stack (infra/template.yaml) to import VPC/subnet from.
+
+  LambdaCodeS3Bucket:
+    Type: String
+    Description: S3 bucket holding the packaged Lambda zip (see infra/deploy_serverless.sh).
+  LambdaCodeS3Key:
+    Type: String
+    Default: openminimax/lambda.zip
+    Description: S3 key of the packaged Lambda zip.
+
+  GpuInstanceId:
+    Type: String
+    Default: ''
+    Description: >-
+      The GPU instance id (base stack output GpuInstanceId) for autostop to control.
+      Empty disables the autostop schedule (e.g. before the GPU tier is launched).
+
+  ResultBucket:
+    Type: String
+    Default: ''
+    Description: >-
+      Private results bucket (base stack output ResultBucketName). The poll Lambda
+      signs a fresh presigned GET here on each `succeeded` (see publish.presign_s3_ref).
+      Empty leaves poll returning the stored s3:// ref unsigned (dev only).
+  ResultKmsKeyArn:
+    Type: String
+    Default: ''
+    Description: >-
+      ARN of the base stack's DataKey (KMS). Needed for the poll Lambda to serve
+      SSE-KMS objects via presigned URL. Empty omits the kms:Decrypt grant.
+
+  AuthorizerCacheTtlSeconds:
+    Type: Number
+    Default: 300
+    MinValue: 0
+    MaxValue: 3600
+    Description: >-
+      Authorizer result cache TTL. Clients poll every ~5s for minutes,
+      so caching by the Authorization header keeps DynamoDB reads low. Trade-off: a
+      revoked key stays usable until its cache entry expires (<= this).
+
+Conditions:
+  WithAutostop: !Not [!Equals [!Ref GpuInstanceId, '']]
+  WithResultBucket: !Not [!Equals [!Ref ResultBucket, '']]
+  WithResultKms: !Not [!Equals [!Ref ResultKmsKeyArn, '']]
+
+Resources:
+  # --- DynamoDB: the shared source of truth (keys + task queue) ---------------
+  KeysTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      TableName: !Sub '${AWS::StackName}-keys'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - { AttributeName: prefix, AttributeType: S }
+      KeySchema:
+        - { AttributeName: prefix, KeyType: HASH }
+      SSESpecification: { SSEEnabled: true }        # KMS-managed encryption at rest
+      PointInTimeRecoverySpecification: { PointInTimeRecoveryEnabled: true }
+
+  TasksTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      TableName: !Sub '${AWS::StackName}-tasks'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - { AttributeName: task_id, AttributeType: S }
+        - { AttributeName: status, AttributeType: S }
+        - { AttributeName: kind_status, AttributeType: S }
+        - { AttributeName: created_at, AttributeType: N }
+      KeySchema:
+        - { AttributeName: task_id, KeyType: HASH }
+      GlobalSecondaryIndexes:
+        # kind-filtered claim: the video worker (cuda:0) queries "video#queued", the
+        # image worker (cuda:2) "image#queued" — one table, two workers, no stealing.
+        # NOTE: adding this GSI to the ALREADY-DEPLOYED table must be the ONLY table
+        # change in that CFN update (AWS allows one GSI add per deploy); the table is
+        # Retain, so this is a safe in-place add.
+        - IndexName: kind_status-created_at-index
+          KeySchema:
+            - { AttributeName: kind_status, KeyType: HASH }
+            - { AttributeName: created_at, KeyType: RANGE }
+          Projection: { ProjectionType: ALL }
+        - IndexName: status-created_at-index      # requeue_stale_running (kind-agnostic)
+          KeySchema:
+            - { AttributeName: status, KeyType: HASH }
+            - { AttributeName: created_at, KeyType: RANGE }
+          Projection: { ProjectionType: ALL }
+      SSESpecification: { SSEEnabled: true }
+      PointInTimeRecoverySpecification: { PointInTimeRecoveryEnabled: true }
+
+  # DynamoDB VPC gateway endpoint so the GPU-box worker reaches the tables on the AWS
+  # backbone (no NAT data charge, works even if NAT is down).
+  DynamoDbEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId:
+        Fn::ImportValue: !Sub '${BaseStackName}-VpcId'
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.dynamodb'
+      VpcEndpointType: Gateway
+      RouteTableIds:
+        - Fn::ImportValue: !Sub '${BaseStackName}-PrivateRouteTableId'
+
+  # --- Lambda execution roles (least privilege) ------------------------------
+  AuthorizerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - { Effect: Allow, Principal: { Service: lambda.amazonaws.com }, Action: 'sts:AssumeRole' }
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+      Policies:
+        - PolicyName: read-keys
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # Authorizer only READS the keys table.
+              - Effect: Allow
+                Action: ['dynamodb:GetItem']
+                Resource: !GetAtt KeysTable.Arn
+
+  ApiRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - { Effect: Allow, Principal: { Service: lambda.amazonaws.com }, Action: 'sts:AssumeRole' }
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+      Policies:
+        - PolicyName: keys-meter-and-tasks-rw
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: ['dynamodb:UpdateItem', 'dynamodb:GetItem']
+                Resource: !GetAtt KeysTable.Arn        # rate-limit + meter
+              - Effect: Allow
+                Action: ['dynamodb:PutItem', 'dynamodb:GetItem']
+                Resource: !GetAtt TasksTable.Arn        # enqueue + poll
+        # Poll-time presigning: the API Lambda (not the write-only worker) signs the
+        # download URL, so it needs read on the results objects + decrypt of the SSE
+        # key. Scoped to results/* and added only when the bucket param is supplied.
+        - !If
+          - WithResultBucket
+          - PolicyName: results-read-for-presign
+            PolicyDocument:
+              Version: '2012-10-17'
+              Statement:
+                - Effect: Allow
+                  Action: ['s3:GetObject']
+                  Resource: !Sub 'arn:${AWS::Partition}:s3:::${ResultBucket}/results/*'
+                - !If
+                  - WithResultKms
+                  - Effect: Allow
+                    Action: ['kms:Decrypt']
+                    Resource: !Ref ResultKmsKeyArn
+                  - !Ref 'AWS::NoValue'
+          - !Ref 'AWS::NoValue'
+
+  AutostopRole:
+    Type: AWS::IAM::Role
+    Condition: WithAutostop
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - { Effect: Allow, Principal: { Service: lambda.amazonaws.com }, Action: 'sts:AssumeRole' }
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+      Policies:
+        - PolicyName: read-tasks-and-scoped-startstop
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: ['dynamodb:Query', 'dynamodb:Scan']
+                Resource:
+                  - !GetAtt TasksTable.Arn
+                  - !Sub '${TasksTable.Arn}/index/*'
+              - Effect: Allow
+                Action: ['ec2:DescribeInstances', 'ec2:DescribeInstanceStatus']
+                Resource: '*'                          # Describe cannot be scoped
+              - Effect: Allow
+                Action: ['ec2:StartInstances', 'ec2:StopInstances']
+                Resource: '*'
+                Condition:
+                  StringEquals: { 'aws:ResourceTag/Project': 'openminimax' }
+
+  # --- Lambda functions ------------------------------------------------------
+  AuthorizerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-authorizer'
+      Runtime: python3.13
+      Handler: lambdas.authorizer.handler
+      Role: !GetAtt AuthorizerRole.Arn
+      Timeout: 10
+      MemorySize: 256
+      Code: { S3Bucket: !Ref LambdaCodeS3Bucket, S3Key: !Ref LambdaCodeS3Key }
+      Environment:
+        Variables: { KEYS_TABLE: !Ref KeysTable }
+
+  ApiFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-api'
+      Runtime: python3.13
+      Handler: lambdas.api.handler
+      Role: !GetAtt ApiRole.Arn
+      Timeout: 29
+      MemorySize: 256
+      Code: { S3Bucket: !Ref LambdaCodeS3Bucket, S3Key: !Ref LambdaCodeS3Key }
+      Environment:
+        Variables:
+          KEYS_TABLE: !Ref KeysTable
+          TASKS_TABLE: !Ref TasksTable
+          RESULT_BUCKET: !Ref ResultBucket        # for poll-time presign_s3_ref
+          PRESIGN_TTL_S: '900'                     # 15 min — signed fresh each poll
+
+  AutostopFunction:
+    Type: AWS::Lambda::Function
+    Condition: WithAutostop
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-autostop'
+      Runtime: python3.13
+      Handler: lambdas.autostop.handler
+      Role: !GetAtt AutostopRole.Arn
+      Timeout: 30
+      MemorySize: 256
+      Code: { S3Bucket: !Ref LambdaCodeS3Bucket, S3Key: !Ref LambdaCodeS3Key }
+      Environment:
+        Variables:
+          TASKS_TABLE: !Ref TasksTable
+          GPU_INSTANCE_ID: !Ref GpuInstanceId
+          IDLE_STOP_MINUTES: '15'
+
+  # --- HTTP API (the only public surface) ------------------------------------
+  HttpApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: !Sub '${AWS::StackName}-api'
+      ProtocolType: HTTP
+      # No permissive CORS: the client calls this server-to-server.
+
+  Authorizer:
+    Type: AWS::ApiGatewayV2::Authorizer
+    Properties:
+      ApiId: !Ref HttpApi
+      Name: mmh3-key-authorizer
+      AuthorizerType: REQUEST
+      AuthorizerPayloadFormatVersion: '2.0'
+      EnableSimpleResponses: true
+      IdentitySource: ['$request.header.Authorization']
+      AuthorizerResultTtlInSeconds: !Ref AuthorizerCacheTtlSeconds
+      AuthorizerUri: !Sub
+        - 'arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${Fn}/invocations'
+        - { Fn: !GetAtt AuthorizerFunction.Arn }
+
+  ApiIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref HttpApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt ApiFunction.Arn
+      PayloadFormatVersion: '2.0'
+      IntegrationMethod: POST
+
+  # Every business route requires the authorizer (a valid key).
+  RouteSubmit:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: 'POST /v2/video_generation'
+      AuthorizationType: CUSTOM
+      AuthorizerId: !Ref Authorizer
+      Target: !Sub 'integrations/${ApiIntegration}'
+  RouteQuery:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: 'GET /v2/query/video_generation/{task_id}'
+      AuthorizationType: CUSTOM
+      AuthorizerId: !Ref Authorizer
+      Target: !Sub 'integrations/${ApiIntegration}'
+  RouteImage:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: 'POST /v1/image_generation'
+      AuthorizationType: CUSTOM
+      AuthorizerId: !Ref Authorizer
+      Target: !Sub 'integrations/${ApiIntegration}'
+
+  Stage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref HttpApi
+      StageName: '$default'
+      AutoDeploy: true
+      DefaultRouteSettings:
+        ThrottlingBurstLimit: 50
+        ThrottlingRateLimit: 20
+      AccessLogSettings:
+        DestinationArn: !GetAtt ApiAccessLogGroup.Arn
+        Format: '{"requestId":"$context.requestId","ip":"$context.identity.sourceIp","route":"$context.routeKey","status":"$context.status","authErr":"$context.authorizer.error","latency":"$context.responseLatency"}'
+
+  ApiAccessLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      LogGroupName: !Sub '/aws/http-api/${AWS::StackName}'
+      RetentionInDays: 30
+
+  # --- Lambda invoke permissions for API Gateway -----------------------------
+  AuthorizerPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref AuthorizerFunction
+      Action: 'lambda:InvokeFunction'
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${HttpApi}/authorizers/${Authorizer}'
+  ApiPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ApiFunction
+      Action: 'lambda:InvokeFunction'
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${HttpApi}/*/*'
+
+  # --- EventBridge schedule for autostop (once a minute) ---------------------
+  AutostopSchedule:
+    Type: AWS::Events::Rule
+    Condition: WithAutostop
+    Properties:
+      Name: !Sub '${AWS::StackName}-autostop'
+      ScheduleExpression: 'rate(1 minute)'
+      State: ENABLED
+      Targets:
+        - Id: autostop
+          Arn: !GetAtt AutostopFunction.Arn
+  AutostopSchedulePermission:
+    Type: AWS::Lambda::Permission
+    Condition: WithAutostop
+    Properties:
+      FunctionName: !Ref AutostopFunction
+      Action: 'lambda:InvokeFunction'
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt AutostopSchedule.Arn
+
+Outputs:
+  ApiEndpoint:
+    Description: Set your client's MINIMAX_BASE_URL to this.
+    Value: !GetAtt HttpApi.ApiEndpoint
+  KeysTableName:
+    Value: !Ref KeysTable
+    Export: { Name: !Sub '${AWS::StackName}-KeysTable' }
+  TasksTableName:
+    Value: !Ref TasksTable
+    Export: { Name: !Sub '${AWS::StackName}-TasksTable' }

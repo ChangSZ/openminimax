@@ -1,0 +1,48 @@
+# GPU-box inference server — the diffusers MiniMax-H3 Turbo HTTP shim.
+# Holds ONE warm diffusers pipeline and exposes the async /v1/videos protocol on
+# 127.0.0.1:30010 (loopback only). Replaces the deprecated SGLang serve, which could
+# not apply the Turbo LoRA correctly (noise). The worker (openminimax-worker) talks to
+# this via SGLANG_URL=http://127.0.0.1:30010 — unchanged.
+#
+# Enabled on boot so the box is request-ready after any stop/start with ZERO manual
+# steps. Install (serving/bootstrap.sh does this):
+#   sudo cp infra/openminimax-serve.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now openminimax-serve
+# Watch warm-up:  journalctl -u openminimax-serve -f   (ready when /health {"ready":true};
+# a cold stop/start warms in ~18min while EBS lazy-hydrates the 140GB weights, then fast).
+[Unit]
+Description=openminimax diffusers Turbo server (/v1/videos on :30010)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/openminimax/serving
+# Optional deploy-time overrides (H3_MODEL/H3_LORA/H3_OUTDIR/...) if bootstrap wrote any;
+# the '-' means "don't fail if absent" — the defaults below + in the shim are complete.
+EnvironmentFile=-/etc/openminimax.env
+# cu13 lib paths for the JIT fused-attention kernel (-lcudart under cu13/lib).
+Environment=PATH=/opt/pytorch/bin:/usr/local/bin:/usr/bin:/bin
+Environment=CUDA_HOME=/opt/pytorch/lib/python3.13/site-packages/nvidia/cu13
+Environment=LIBRARY_PATH=/opt/pytorch/lib/python3.13/site-packages/nvidia/cu13/lib:/opt/pytorch/lib/python3.13/site-packages/nvidia/cu13/lib64
+Environment=LD_LIBRARY_PATH=/opt/pytorch/lib/python3.13/site-packages/nvidia/cu13/lib:/opt/pytorch/lib/python3.13/site-packages/nvidia/cu13/lib64
+Environment=PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+Environment=HF_HUB_OFFLINE=1
+Environment=TOKENIZERS_PARALLELISM=false
+# Optional: H3_MODEL / H3_LORA / H3_OUTDIR / H3_STEPS(8) / H3_PORT(30010).
+# H3_OUTDIR must be readable by the worker (it reads file_paths[0] on this same box).
+Environment=H3_OUTDIR=/mnt/models/outputs
+# Serve ALL video workflows: t2va + fl2va (keyframe i2v) AND ref2va (reference-image i2v).
+# "both" loads BOTH the transformer (fl2v LoRA) and transformer_ref (ref2v LoRA) partitions
+# — needs the extra host RAM for a second block-streamed DiT, which the g6e.12xlarge's 372GB
+# comfortably holds. Drop to "fl2va" only for a RAM-constrained, video-first-frame-only box.
+Environment=H3_WORKFLOW=both
+ExecStart=/opt/pytorch/bin/python /opt/openminimax/serving/h3_turbo_server.py
+Restart=always
+RestartSec=15
+# Long warm load; don't let systemd kill it as "not ready".
+TimeoutStartSec=0
+
+[Install]
+WantedBy=multi-user.target

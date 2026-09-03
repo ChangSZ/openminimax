@@ -1,0 +1,28 @@
+# MiniMax v2-compatible gateway — runs on the always-on t3.small box.
+# Install: copy to /etc/systemd/system/, set the env below, then
+#   sudo systemctl daemon-reload && sudo systemctl enable --now openminimax-gateway
+[Unit]
+Description=openminimax MiniMax v2-compatible gateway
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ec2-user
+WorkingDirectory=/opt/openminimax/gateway
+# SGLANG_URL is the GPU box's PRIVATE ip:30010 (stack output GpuPrivateIp) — reachable
+# only from this box's SG. RESULT_BUCKET is the stack's ResultBucketName. ADMIN_TOKEN
+# should come from Secrets Manager / SSM SecureString in a real deploy, not inline.
+Environment=SGLANG_URL=http://REPLACE_GPU_PRIVATE_IP:30010
+Environment=RESULT_BUCKET=REPLACE_WITH_STACK_OUTPUT
+Environment=PRESIGN_TTL_S=3600
+Environment=GATEWAY_DB=/opt/openminimax/gateway/gateway.db
+Environment=ADMIN_TOKEN=REPLACE_ME
+# Bind to the private interface only. The client-facing ingress (PrivateLink /
+# internal ALB / 443+WAF) terminates in front of this — never expose 8080 publicly.
+ExecStart=/usr/bin/python3 -m uvicorn --factory app.main:get_app --host 0.0.0.0 --port 8080
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

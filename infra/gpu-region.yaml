@@ -1,0 +1,204 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  openminimax ROAMING GPU stack — a self-contained, region-portable g6e GPU box that
+  runs the SGLang worker and reaches the FIXED control plane (DynamoDB tables, result
+  S3 bucket, KMS key) in the home region cross-region. Deploy this into ANY region
+  that has g6e capacity; the control plane never moves. See ../docs/PLAN.md.
+
+# The GPU box is stateless compute: the worker DIALS OUT (reads the DynamoDB queue,
+# writes results to S3), nothing connects IN. So it can live in any region, and its
+# security group has ZERO inbound rules — "no public port" holds by construction even
+# though the box has a public IP for egress (SSM + model pull + cross-region AWS).
+# Access is SSM Session Manager (outbound only); no SSH, no NAT gateway needed.
+
+Parameters:
+  GpuInstanceType:
+    Type: String
+    Default: g6e.12xlarge
+  GpuAmiId:
+    Type: 'AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>'
+    Default: /aws/service/deeplearning/ami/x86_64/oss-nvidia-driver-gpu-pytorch-2.12-ubuntu-24.04/latest/ami-id
+    Description: PyTorch DLAMI (torch+CUDA preinstalled). Resolved per-region from SSM.
+  ComputeAz:
+    Type: AWS::EC2::AvailabilityZone::Name
+    Description: AZ to launch in (the global hunt script sets this per attempt).
+  VpcCidr:
+    Type: String
+    Default: 10.60.0.0/24
+  ModelVolumeSizeGb:
+    Type: Number
+    Default: 400
+    MinValue: 300
+
+  # --- the FIXED control plane (home region), reached cross-region --------------
+  # All of these point at YOUR control plane (the serverless stack in your home
+  # region + account). deploy_gpu_global.sh auto-discovers and passes them, so you
+  # rarely set them by hand — but there are deliberately NO account-specific defaults
+  # here, so deploying this template stand-alone forces you to name your own resources.
+  HomeRegion:
+    Type: String
+    Default: us-west-2
+    Description: Region where the control plane (DynamoDB/S3/KMS) lives. Change to yours.
+  KeysTableArn:
+    Type: String
+    Description: ARN of the home-region DynamoDB keys table.
+  TasksTableArn:
+    Type: String
+    Description: ARN of the home-region DynamoDB tasks table.
+  KeysTableName:
+    Type: String
+    Default: openminimax-serverless-keys
+    Description: Name of the home-region keys table (default = serverless-stack naming).
+  TasksTableName:
+    Type: String
+    Default: openminimax-serverless-tasks
+    Description: Name of the home-region tasks table (default = serverless-stack naming).
+  ResultBucketArn:
+    Type: String
+    Description: ARN of YOUR private result bucket (arn:aws:s3:::<your-result-bucket>).
+  ResultBucketName:
+    Type: String
+    Description: Name of YOUR private result bucket (base-stack output ResultBucketName).
+  DataKeyArn:
+    Type: String
+    Description: ARN of the home-region KMS key that encrypts the result bucket.
+
+Resources:
+  # --- minimal network: 1 public subnet, IGW, no NAT ---------------------------
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags: [{ Key: Name, Value: !Sub '${AWS::StackName}-vpc' }, { Key: Project, Value: openminimax }]
+  Igw:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags: [{ Key: Name, Value: !Sub '${AWS::StackName}-igw' }]
+  IgwAttach:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties: { VpcId: !Ref Vpc, InternetGatewayId: !Ref Igw }
+  Subnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: !Ref VpcCidr
+      AvailabilityZone: !Ref ComputeAz
+      MapPublicIpOnLaunch: true       # public IP for EGRESS only; SG blocks all inbound
+      Tags: [{ Key: Name, Value: !Sub '${AWS::StackName}-subnet' }]
+  RouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties: { VpcId: !Ref Vpc, Tags: [{ Key: Name, Value: !Sub '${AWS::StackName}-rt' }] }
+  DefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: IgwAttach
+    Properties:
+      RouteTableId: !Ref RouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref Igw
+  SubnetAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { RouteTableId: !Ref RouteTable, SubnetId: !Ref Subnet }
+
+  # SG with NO inbound rules at all — the box is dial-out only. This is what makes a
+  # public-subnet GPU still "no public port". Egress open for model pull + AWS APIs.
+  GpuSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: openminimax roaming GPU. Zero inbound. Egress only (SSM, model, DDB, S3).
+      VpcId: !Ref Vpc
+      SecurityGroupEgress:
+        - { IpProtocol: -1, CidrIp: 0.0.0.0/0, Description: egress for SSM model pull and AWS APIs }
+      Tags: [{ Key: Name, Value: !Sub '${AWS::StackName}-gpu-sg' }]
+
+  # --- IAM: SSM + cross-region access to the FIXED control plane ---------------
+  GpuRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - { Effect: Allow, Principal: { Service: ec2.amazonaws.com }, Action: 'sts:AssumeRole' }
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/AmazonSSMManagedInstanceCore'
+      Policies:
+        - PolicyName: control-plane-cross-region
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # Task queue: claim/update tasks (+ the status GSI for claim_next).
+              - Effect: Allow
+                Action: ['dynamodb:GetItem', 'dynamodb:Query', 'dynamodb:UpdateItem']
+                Resource:
+                  - !Ref TasksTableArn
+                  - !Sub '${TasksTableArn}/index/*'
+              # Keys table: the seconds-billed meter.
+              - Effect: Allow
+                Action: ['dynamodb:UpdateItem']
+                Resource: !Ref KeysTableArn
+              # Result mp4s -> home-region bucket.
+              - Effect: Allow
+                Action: ['s3:PutObject']
+                Resource: !Sub '${ResultBucketArn}/*'
+              # KMS to encrypt those objects (the bucket's SSE key).
+              - Effect: Allow
+                Action: ['kms:GenerateDataKey', 'kms:Encrypt']
+                Resource: !Ref DataKeyArn
+  GpuInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties: { Roles: [!Ref GpuRole] }
+
+  # --- the GPU instance --------------------------------------------------------
+  GpuInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: !Ref GpuInstanceType
+      ImageId: !Ref GpuAmiId
+      IamInstanceProfile: !Ref GpuInstanceProfile
+      SubnetId: !Ref Subnet
+      SecurityGroupIds: [!Ref GpuSecurityGroup]
+      MetadataOptions: { HttpTokens: required, HttpPutResponseHopLimit: 1 }
+      BlockDeviceMappings:
+        - DeviceName: /dev/sda1
+          Ebs: { VolumeType: gp3, VolumeSize: 100, Encrypted: true, DeleteOnTermination: true }
+        - DeviceName: /dev/sdf
+          Ebs: { VolumeType: gp3, VolumeSize: !Ref ModelVolumeSizeGb, Encrypted: true, DeleteOnTermination: true }
+      Tags:
+        - { Key: Name, Value: !Sub '${AWS::StackName}-gpu' }
+        - { Key: Project, Value: openminimax }
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -euxo pipefail
+          # Mount the weights volume at /mnt/models (idempotent).
+          DEV=/dev/nvme1n1
+          if [ -b "$DEV" ]; then
+            blkid "$DEV" || mkfs.ext4 -m0 "$DEV"
+            mkdir -p /mnt/models
+            grep -q "/mnt/models" /etc/fstab || echo "$DEV /mnt/models ext4 defaults,nofail 0 2" >> /etc/fstab
+            mount -a
+          fi
+          # Pin the home region so the worker's boto3 + serve scripts hit the right tables.
+          cat >/etc/profile.d/openminimax.sh <<EOF
+          export AWS_DEFAULT_REGION=${HomeRegion}
+          export KEYS_TABLE=${KeysTableName}
+          export TASKS_TABLE=${TasksTableName}
+          export RESULT_BUCKET=${ResultBucketName}
+          export SGLANG_URL=http://127.0.0.1:30010
+          export SGLANG_STEPS=9
+          EOF
+
+Outputs:
+  GpuInstanceId:
+    Value: !Ref GpuInstance
+  GpuRegion:
+    Value: !Ref AWS::Region
+  GpuAz:
+    Value: !Ref ComputeAz
+  Note:
+    Value: >-
+      SSM into this box, ship the repo over (no git needed), and run
+      `sudo RESULT_BUCKET=<bucket> bash serving/bootstrap.sh` — it installs deps + weights,
+      deploys to /opt/openminimax, writes /etc/openminimax.env, and enables the serve+worker
+      units (auto-start on boot). Reaches the home-region control plane cross-region.

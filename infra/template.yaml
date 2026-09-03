@@ -1,0 +1,542 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  openminimax: private VPC + locked-down security groups + private result bucket +
+  least-privilege IAM + (optional) g6e.12xlarge GPU instance and t3.small gateway
+  instance for self-hosting MiniMax-H3 behind a MiniMax v2-compatible gateway.
+  SECURITY: SGLang is never publicly reachable; the GPU box has no public IP and no
+  SSH; access is via SSM Session Manager. See ../docs/PLAN.md section 7.
+
+Metadata:
+  cfn-lint:
+    config:
+      # GpuAmiId is deliberately a String with an empty default (see the parameter):
+      # a base, no-GPU deploy must not require an AMI. deploy.sh passes a real DLAMI
+      # only when LaunchGpuInstance=true.
+      ignore_checks: [W2506, W1030]
+
+# NOTE (to the operator, not an instruction to any tool): the GPU instance is gated
+# behind LaunchGpuInstance=false so a base deploy creates only free/near-free
+# resources (VPC, subnets, SGs, IAM, empty bucket). The NAT gateway — the only
+# meaningful standing cost — is created ONLY when some compute is launched. The
+# g6e.12xlarge bills ~$10/hr and must be an explicit, approved choice.
+
+Parameters:
+  VpcCidr:
+    Type: String
+    Default: 10.42.0.0/16
+    AllowedPattern: '^([0-9]{1,3}\.){3}[0-9]{1,3}/[0-9]{1,2}$'
+    Description: CIDR for the dedicated VPC.
+
+  ComputeAz:
+    Type: AWS::EC2::AvailabilityZone::Name
+    Default: us-west-2b
+    Description: >-
+      AZ for the public + private subnets (and thus the GPU box). g6e capacity is
+      per-AZ and shifts; if a launch fails with InsufficientInstanceCapacity, AWS's
+      error names the AZs that DO have it — set this to one of those and redeploy.
+      (us-west-2a was capacity-starved for g6e.12xlarge at first launch; 2b/2c/2d
+      had it.) Full multi-AZ resilience is tracked separately; this is the one knob
+      that unblocks a launch immediately.
+
+  LaunchGpuInstance:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: >-
+      Launch the g6e.12xlarge GPU instance (~$10/hr). Leave false to deploy only the
+      free networking/IAM/bucket scaffolding; set true only when approved to spend.
+
+  LaunchGatewayInstance:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: Launch the always-on t3.small gateway/controller instance (~$15/mo).
+
+  GpuInstanceType:
+    Type: String
+    Default: g6e.12xlarge
+    Description: GPU instance type (4x L40S = 192GB on g6e.12xlarge; see PLAN §5).
+
+  GpuAmiId:
+    Type: String
+    Default: ''
+    AllowedPattern: '^$|^ami-[0-9a-f]+$'
+    Description: >-
+      AMI for the GPU box - a Deep Learning OSS Nvidia AMI. Left empty for base
+      deploys (GPU not launched). deploy.sh resolves the current DLAMI from SSM and
+      passes it when LaunchGpuInstance=true. A plain String (not an SSM-resolved
+      type) so a base deploy never fails on AMI resolution.
+      # cfn-lint W2506/W1030 are intentional: an Image::Id type would reject the
+      # empty default that keeps base deploys free.
+
+  GatewayAmiId:
+    Type: 'AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>'
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+    Description: AMI for the small gateway/controller box (Amazon Linux 2023).
+
+  ModelVolumeSizeGb:
+    Type: Number
+    Default: 800
+    MinValue: 500
+    Description: >-
+      gp3 EBS for the modular checkpoint (~140GB) + optional FLUX.2 (~60GB) + Turbo LoRAs
+      + HF cache (can transiently double a shard during download) + output headroom. 800
+      gives comfortable room to cache multiple model variants; 500 is the floor (PLAN §3).
+
+Conditions:
+  WithGpu: !Equals [!Ref LaunchGpuInstance, 'true']
+  WithGateway: !Equals [!Ref LaunchGatewayInstance, 'true']
+  # NAT (a standing ~$32/mo cost) exists only when something needs egress.
+  WithEgress: !Or [!Condition WithGpu, !Condition WithGateway]
+  # Which AZ the compute lands in — drives the subnet pick. g6e capacity is per-AZ
+  # and flaps, so we keep a private subnet in EVERY AZ and just point the instance at
+  # the one matching ComputeAz. Switching AZ then replaces only the instance (fast),
+  # not the subnet/NAT.
+  # NOTE: Fn::GetAZs is NOT allowed inside Conditions, so compare against literal AZ
+  # names built from the region. This assumes the first four AZs are <region>{a,b,c,d}
+  # (true for us-west-2 and the other large regions we'd use).
+  ComputeAzIsA: !Equals [!Ref ComputeAz, !Sub '${AWS::Region}a']
+  ComputeAzIsB: !Equals [!Ref ComputeAz, !Sub '${AWS::Region}b']
+  ComputeAzIsC: !Equals [!Ref ComputeAz, !Sub '${AWS::Region}c']
+
+Resources:
+  # --- KMS: one key for EBS + S3 at-rest encryption (PLAN §7.5) ---------------
+  DataKey:
+    Type: AWS::KMS::Key
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      Description: !Sub '${AWS::StackName} openminimax at-rest encryption'
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: EnableRootAccountAdmin
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:root'
+            Action: 'kms:*'
+            Resource: '*'
+  DataKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub 'alias/${AWS::StackName}-openminimax'
+      TargetKeyId: !Ref DataKey
+
+  # --- Network: dedicated VPC, one public (NAT) + one private subnet ----------
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - { Key: Name, Value: !Sub '${AWS::StackName}-vpc' }
+        - { Key: Project, Value: openminimax }
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags: [{ Key: Name, Value: !Sub '${AWS::StackName}-igw' }]
+  IgwAttach:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref Vpc
+      InternetGatewayId: !Ref InternetGateway
+
+  # Public subnet hosts ONLY the NAT gateway — no instance gets a public IP here.
+  # Pinned to the first AZ; NAT works cross-AZ for the private subnets.
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: !Select [0, !Cidr [!GetAtt Vpc.CidrBlock, 8, 8]]
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: false
+      Tags: [{ Key: Name, Value: !Sub '${AWS::StackName}-public' }]
+
+  # A private subnet in EVERY AZ. g6e capacity is per-AZ and FLAPS (observed: 2a full
+  # then 2b full within minutes), so we keep a home in all of them and point the
+  # instance at whichever AZ has capacity (ComputeAz). Switching AZ then replaces only
+  # the instance — fast — instead of the subnet+NAT. CIDR indices 4-7 are fresh (the
+  # single-AZ v1 used 0/1), so this update never collides on a CIDR.
+  PrivateSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: !Select [4, !Cidr [!GetAtt Vpc.CidrBlock, 8, 8]]
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: false
+      Tags: [{ Key: Name, Value: !Sub '${AWS::StackName}-private-a' }]
+  PrivateSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: !Select [5, !Cidr [!GetAtt Vpc.CidrBlock, 8, 8]]
+      AvailabilityZone: !Select [1, !GetAZs '']
+      MapPublicIpOnLaunch: false
+      Tags: [{ Key: Name, Value: !Sub '${AWS::StackName}-private-b' }]
+  PrivateSubnetC:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: !Select [6, !Cidr [!GetAtt Vpc.CidrBlock, 8, 8]]
+      AvailabilityZone: !Select [2, !GetAZs '']
+      MapPublicIpOnLaunch: false
+      Tags: [{ Key: Name, Value: !Sub '${AWS::StackName}-private-c' }]
+  PrivateSubnetD:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: !Select [7, !Cidr [!GetAtt Vpc.CidrBlock, 8, 8]]
+      # Index 3 into a list PADDED with the first AZ so it resolves in 3-AZ regions
+      # too (e.g. ap-northeast-1 has only a/c/d). In 4-AZ regions this is the real 4th
+      # AZ (unchanged); in 3-AZ regions it wraps to AZ-a — harmless, since subnet D is
+      # unused unless ComputeAz picks the 4th AZ, and it keeps its own distinct CIDR.
+      AvailabilityZone: !Select
+        - 3
+        - !Split [',', !Sub ['${azs},${a},${a},${a}', {azs: !Join [',', !GetAZs ''], a: !Select [0, !GetAZs '']}]]
+      MapPublicIpOnLaunch: false
+      Tags: [{ Key: Name, Value: !Sub '${AWS::StackName}-private-d' }]
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags: [{ Key: Name, Value: !Sub '${AWS::StackName}-public-rt' }]
+  PublicDefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: IgwAttach
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+  PublicSubnetAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      SubnetId: !Ref PublicSubnet
+
+  NatEip:
+    Type: AWS::EC2::EIP
+    Condition: WithEgress
+    DependsOn: IgwAttach
+    Properties:
+      Domain: vpc
+  NatGateway:
+    Type: AWS::EC2::NatGateway
+    Condition: WithEgress
+    Properties:
+      AllocationId: !GetAtt NatEip.AllocationId
+      SubnetId: !Ref PublicSubnet
+      Tags: [{ Key: Name, Value: !Sub '${AWS::StackName}-nat' }]
+
+  # One private route table, shared by all private subnets (all egress via the one
+  # NAT). Never replaced, so the serverless stack's import of it stays valid.
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags: [{ Key: Name, Value: !Sub '${AWS::StackName}-private-rt' }]
+  PrivateDefaultRoute:
+    Type: AWS::EC2::Route
+    Condition: WithEgress
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway
+  PrivateSubnetAssocA:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { RouteTableId: !Ref PrivateRouteTable, SubnetId: !Ref PrivateSubnetA }
+  PrivateSubnetAssocB:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { RouteTableId: !Ref PrivateRouteTable, SubnetId: !Ref PrivateSubnetB }
+  PrivateSubnetAssocC:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { RouteTableId: !Ref PrivateRouteTable, SubnetId: !Ref PrivateSubnetC }
+  PrivateSubnetAssocD:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { RouteTableId: !Ref PrivateRouteTable, SubnetId: !Ref PrivateSubnetD }
+
+  # S3 gateway endpoint: result-bucket traffic stays on the AWS backbone (no NAT
+  # data charges for S3, and it works even before NAT exists).
+  S3Endpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref Vpc
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.s3'
+      VpcEndpointType: Gateway
+      RouteTableIds: [!Ref PrivateRouteTable, !Ref PublicRouteTable]
+
+  # --- Security groups: the core of the "no public port" guarantee -----------
+  GatewaySecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: >-
+        openminimax gateway/controller. No ingress rule is defined here by default.
+        The client-facing ingress (PrivateLink / internal ALB / 443+WAF) is an
+        explicit decision (PLAN section 7.2), added deliberately, never a blanket
+        0.0.0.0/0.
+      VpcId: !Ref Vpc
+      SecurityGroupEgress:
+        - { IpProtocol: -1, CidrIp: 0.0.0.0/0, Description: egress for S3/SSM/model pulls }
+      Tags: [{ Key: Name, Value: !Sub '${AWS::StackName}-gateway-sg' }]
+
+  SglangSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: >-
+        SGLang inference. Inbound 30010 ONLY from the gateway SG (SG-referencing,
+        not a CIDR). Never open to the internet. See PLAN section 7.1.
+      VpcId: !Ref Vpc
+      SecurityGroupEgress:
+        - { IpProtocol: -1, CidrIp: 0.0.0.0/0, Description: egress for HF model pull + SSM }
+      Tags: [{ Key: Name, Value: !Sub '${AWS::StackName}-sglang-sg' }]
+  # Separate ingress resource so the two SGs can reference each other without a cycle.
+  SglangIngressFromGateway:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref SglangSecurityGroup
+      IpProtocol: tcp
+      FromPort: 30010
+      ToPort: 30010
+      SourceSecurityGroupId: !Ref GatewaySecurityGroup
+      Description: SGLang 30010 from gateway SG only
+
+  # --- Private result bucket (PLAN §7.4) -------------------------------------
+  ResultBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Sub '${AWS::StackName}-results-${AWS::AccountId}'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: aws:kms
+              KMSMasterKeyID: !Ref DataKey
+            BucketKeyEnabled: true
+      VersioningConfiguration: { Status: Enabled }
+      LifecycleConfiguration:
+        Rules:
+          - Id: expire-old-results
+            Status: Enabled
+            ExpirationInDays: 7          # results are handed off as presigned URLs
+            NoncurrentVersionExpiration: { NoncurrentDays: 1 }
+
+  ResultBucketTlsOnlyPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref ResultBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !GetAtt ResultBucket.Arn
+              - !Sub '${ResultBucket.Arn}/*'
+            Condition: { Bool: { 'aws:SecureTransport': 'false' } }
+
+  # --- IAM: least privilege, SSM-managed, scoped start/stop -------------------
+  GpuInstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ec2.amazonaws.com }
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/AmazonSSMManagedInstanceCore'
+      Policies:
+        - PolicyName: results-write-and-kms
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: ['s3:PutObject']
+                Resource: !Sub '${ResultBucket.Arn}/*'
+              - Effect: Allow
+                Action: ['kms:GenerateDataKey', 'kms:Encrypt']
+                Resource: !GetAtt DataKey.Arn
+        # The GPU-box workers drain the DynamoDB task queue and meter usage on the keys
+        # table (gateway/app/tasks.py + keys metering). GetItem/Query/UpdateItem/PutItem on
+        # tasks + its GSIs; UpdateItem/GetItem on keys. (In the split roaming-GPU layout
+        # these come from gpu-region.yaml's GpuRole; the all-in-one base stack needs them here.)
+        - PolicyName: control-plane-dynamodb
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: ['dynamodb:GetItem', 'dynamodb:Query', 'dynamodb:UpdateItem', 'dynamodb:PutItem']
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${AWS::StackName}-serverless-tasks'
+                  - !Sub 'arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${AWS::StackName}-serverless-tasks/index/*'
+              - Effect: Allow
+                Action: ['dynamodb:GetItem', 'dynamodb:UpdateItem']
+                Resource: !Sub 'arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${AWS::StackName}-serverless-keys'
+  GpuInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles: [!Ref GpuInstanceRole]
+
+  GatewayInstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ec2.amazonaws.com }
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/AmazonSSMManagedInstanceCore'
+      Policies:
+        - PolicyName: results-rw-kms-and-scoped-startstop
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: ['s3:PutObject', 's3:GetObject']
+                Resource: !Sub '${ResultBucket.Arn}/*'
+              - Effect: Allow
+                Action: ['kms:GenerateDataKey', 'kms:Encrypt', 'kms:Decrypt']
+                Resource: !GetAtt DataKey.Arn
+              # Describe cannot be resource-scoped; read-only, so it is safe broad.
+              - Effect: Allow
+                Action: ['ec2:DescribeInstances', 'ec2:DescribeInstanceStatus']
+                Resource: '*'
+              # Start/stop restricted to THIS project's tagged instances only.
+              - Effect: Allow
+                Action: ['ec2:StartInstances', 'ec2:StopInstances']
+                Resource: '*'
+                Condition:
+                  StringEquals: { 'aws:ResourceTag/Project': 'openminimax' }
+  GatewayInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles: [!Ref GatewayInstanceRole]
+
+  # --- Compute (both optional / approval-gated) ------------------------------
+  GpuInstance:
+    Type: AWS::EC2::Instance
+    Condition: WithGpu
+    Properties:
+      InstanceType: !Ref GpuInstanceType
+      ImageId: !Ref GpuAmiId
+      IamInstanceProfile: !Ref GpuInstanceProfile
+      # The private subnet in ComputeAz. Switch ComputeAz to relaunch in an AZ that
+      # has g6e capacity — replaces only the instance, not the network.
+      SubnetId: !If [ComputeAzIsA, !Ref PrivateSubnetA,
+                     !If [ComputeAzIsB, !Ref PrivateSubnetB,
+                          !If [ComputeAzIsC, !Ref PrivateSubnetC, !Ref PrivateSubnetD]]]
+      SecurityGroupIds: [!Ref SglangSecurityGroup]
+      # No public IP, no SSH key — access is SSM Session Manager only.
+      MetadataOptions:
+        HttpTokens: required            # IMDSv2 mandatory
+        HttpPutResponseHopLimit: 1
+      BlockDeviceMappings:
+        - DeviceName: /dev/sda1
+          Ebs:
+            VolumeType: gp3
+            VolumeSize: 100
+            Encrypted: true
+            KmsKeyId: !Ref DataKey
+            DeleteOnTermination: true
+        - DeviceName: /dev/sdf          # weights cache — survives stop/start
+          Ebs:
+            VolumeType: gp3
+            VolumeSize: !Ref ModelVolumeSizeGb
+            Encrypted: true
+            KmsKeyId: !Ref DataKey
+            DeleteOnTermination: true
+      Tags:
+        - { Key: Name, Value: !Sub '${AWS::StackName}-gpu' }
+        - { Key: Project, Value: openminimax }   # gates the scoped start/stop policy
+      UserData:
+        Fn::Base64: |
+          #!/bin/bash
+          set -euxo pipefail
+          # Format + mount the weights volume at /mnt/models (idempotent).
+          DEV=/dev/nvme1n1
+          if [ -b "$DEV" ]; then
+            blkid "$DEV" || mkfs.ext4 -m0 "$DEV"
+            mkdir -p /mnt/models
+            grep -q "/mnt/models" /etc/fstab || echo "$DEV /mnt/models ext4 defaults,nofail 0 2" >> /etc/fstab
+            mount -a
+          fi
+
+  GatewayInstance:
+    Type: AWS::EC2::Instance
+    Condition: WithGateway
+    Properties:
+      InstanceType: t3.small
+      ImageId: !Ref GatewayAmiId
+      IamInstanceProfile: !Ref GatewayInstanceProfile
+      # Gateway is not capacity-constrained; keep it with the GPU's AZ for locality.
+      SubnetId: !If [ComputeAzIsA, !Ref PrivateSubnetA,
+                     !If [ComputeAzIsB, !Ref PrivateSubnetB,
+                          !If [ComputeAzIsC, !Ref PrivateSubnetC, !Ref PrivateSubnetD]]]
+      SecurityGroupIds: [!Ref GatewaySecurityGroup]
+      MetadataOptions:
+        HttpTokens: required
+        HttpPutResponseHopLimit: 1
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs:
+            VolumeType: gp3
+            VolumeSize: 20
+            Encrypted: true
+            KmsKeyId: !Ref DataKey
+            DeleteOnTermination: true
+      Tags:
+        - { Key: Name, Value: !Sub '${AWS::StackName}-gateway' }
+        - { Key: Project, Value: openminimax }
+
+Outputs:
+  VpcId:
+    Value: !Ref Vpc
+    Export: { Name: !Sub '${AWS::StackName}-VpcId' }
+  PrivateSubnetId:
+    Description: The private subnet in the currently-selected ComputeAz.
+    Value: !If [ComputeAzIsA, !Ref PrivateSubnetA,
+                !If [ComputeAzIsB, !Ref PrivateSubnetB,
+                     !If [ComputeAzIsC, !Ref PrivateSubnetC, !Ref PrivateSubnetD]]]
+    Export: { Name: !Sub '${AWS::StackName}-PrivateSubnetId' }
+  PrivateSubnetIds:
+    Description: All private subnets (one per AZ), for multi-AZ consumers.
+    Value: !Join [',', [!Ref PrivateSubnetA, !Ref PrivateSubnetB,
+                        !Ref PrivateSubnetC, !Ref PrivateSubnetD]]
+  ComputeAzInUse:
+    Value: !Ref ComputeAz
+  PrivateRouteTableId:
+    Description: For the serverless stack's DynamoDB VPC gateway endpoint.
+    Value: !Ref PrivateRouteTable
+    Export: { Name: !Sub '${AWS::StackName}-PrivateRouteTableId' }
+  GatewaySecurityGroupId:
+    Description: Attach the client-facing ingress to THIS sg (PLAN §7.2).
+    Value: !Ref GatewaySecurityGroup
+  SglangSecurityGroupId:
+    Value: !Ref SglangSecurityGroup
+  ResultBucketName:
+    Description: Set the gateway's RESULT_BUCKET to this.
+    Value: !Ref ResultBucket
+  GpuInstanceId:
+    Condition: WithGpu
+    Description: Private IP reachable only from the gateway SG; SGLANG_URL uses it.
+    Value: !Ref GpuInstance
+  GpuPrivateIp:
+    Condition: WithGpu
+    Value: !GetAtt GpuInstance.PrivateIp
+  GatewayInstanceId:
+    Condition: WithGateway
+    Value: !Ref GatewayInstance

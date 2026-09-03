@@ -1,0 +1,53 @@
+# GPU-box FLUX image server — the diffusers FLUX.2 fp8 text-to-image HTTP shim.
+# Holds ONE warm FLUX.2 pipeline RESIDENT on an otherwise-idle L40S (cuda:2) and
+# exposes the async /v1/images protocol on 127.0.0.1:30020 (loopback only). Runs in
+# PARALLEL with the H3 video shim on cuda:0 — physically isolated by CUDA_VISIBLE_DEVICES,
+# no model swapping. The image worker (openminimax-image-worker) talks to this via
+# FLUX_URL=http://127.0.0.1:30020. See README §2.
+#
+# Enabled on boot so image generation is ready after any stop/start with zero manual
+# steps. Install (serving/bootstrap.sh does this if FLUX weights are present):
+#   sudo cp infra/openminimax-flux.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now openminimax-flux
+# Watch warm-up:  journalctl -u openminimax-flux -f   (ready when /health {"ready":true})
+#
+# VERIFIED on 4×L40S (2026-09-02): FLUX.2-dev fp8 loads RESIDENT on cuda:2 (~31GB) and
+# produces clean 1024x768 images at ~37.5s each, in parallel with H3 video on cuda:0.
+# PREREQ: the OFFICIAL diffusers FLUX.2 dir on the EBS volume at /mnt/models/flux2-official
+# (transformer/ text_encoder/ vae/ tokenizer/). MUST be on /mnt/models (EBS, persists),
+# NOT /opt/dlami/nvme (instance-store — wiped on stop/start, unit then fails to load).
+[Unit]
+Description=openminimax FLUX.2 image server (/v1/images on :30020, cuda:2)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/openminimax/serving
+Environment=PATH=/opt/pytorch/bin:/usr/local/bin:/usr/bin:/bin
+# Pin to the idle card — this process only ever sees cuda:2 (as its own cuda:0), so it
+# CANNOT touch H3 on cuda:0.
+Environment=CUDA_VISIBLE_DEVICES=2
+# cu13 lib paths for any JIT kernel (-lcudart under cu13/lib), same as the H3 serve.
+Environment=CUDA_HOME=/opt/pytorch/lib/python3.13/site-packages/nvidia/cu13
+Environment=LIBRARY_PATH=/opt/pytorch/lib/python3.13/site-packages/nvidia/cu13/lib:/opt/pytorch/lib/python3.13/site-packages/nvidia/cu13/lib64
+Environment=LD_LIBRARY_PATH=/opt/pytorch/lib/python3.13/site-packages/nvidia/cu13/lib:/opt/pytorch/lib/python3.13/site-packages/nvidia/cu13/lib64
+# Reduce fragmentation at the 48GB edge (same trick H3 uses at 46GB).
+Environment=PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+Environment=HF_HUB_OFFLINE=1
+Environment=TOKENIZERS_PARALLELISM=false
+# Weights on the EBS volume (survives stop/start). The shim's default matches this, but
+# we set it explicitly so a stray instance-store default can never sneak back in.
+Environment=FLUX_MODEL=/mnt/models/flux2-official
+# Optional: FLUX_LORA / FLUX_STEPS / FLUX_PORT(30020). FLUX_OUTDIR must be readable by
+# the image worker (same box); keep it on EBS too.
+Environment=FLUX_OUTDIR=/mnt/models/outputs
+ExecStart=/opt/pytorch/bin/python /opt/openminimax/serving/flux_image_server.py
+Restart=always
+RestartSec=15
+# Long warm load; don't let systemd kill it as "not ready".
+TimeoutStartSec=0
+
+[Install]
+WantedBy=multi-user.target

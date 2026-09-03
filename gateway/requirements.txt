@@ -1,0 +1,10 @@
+# openminimax gateway — runtime deps. Stdlib does the rest (sqlite3, hashlib, hmac,
+# secrets, urllib). boto3 is only needed for the real S3Publisher; dev/CI with
+# USE_FAKE_BACKEND=1 + LocalPublisher does not import it.
+fastapi>=0.111
+uvicorn[standard]>=0.30
+boto3>=1.34
+
+# dev/test only:
+#   pytest>=8
+#   httpx>=0.27   (fastapi TestClient)

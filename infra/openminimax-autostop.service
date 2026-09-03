@@ -1,0 +1,24 @@
+# Scale-to-zero controller — runs on the always-on t3.small gateway box.
+# Install: copy to /etc/systemd/system/, set the env below, then
+#   sudo systemctl daemon-reload && sudo systemctl enable --now openminimax-autostop
+[Unit]
+Description=openminimax GPU auto-stop controller
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ec2-user
+WorkingDirectory=/opt/openminimax/infra
+# GPU_INSTANCE_ID comes from the stack output (GpuInstanceId). GATEWAY_DB must point
+# at the SAME sqlite file the gateway writes (so queue state is shared).
+Environment=AWS_REGION=us-west-2
+Environment=GPU_INSTANCE_ID=REPLACE_WITH_STACK_OUTPUT
+Environment=GATEWAY_DB=/opt/openminimax/gateway/gateway.db
+Environment=IDLE_STOP_MINUTES=15
+ExecStart=/usr/bin/python3 /opt/openminimax/infra/autostop_controller.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

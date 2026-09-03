@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.egg-info/
+.venv/
+venv/
+
+# gateway local state (never commit keys/tasks DB or result media)
+*.db
+*.sqlite
+*.sqlite3
+gateway/gateway.db
+
+# local results / model artifacts (huge; live on EBS/S3, not in git)
+results/
+*.mp4
+models/
+*.safetensors
+# Sample/proof clips are NOT committed either — keep the repo binary-free.
+# Regenerate them with the smoke tests in serving/ or fetch from your S3.
+serving/phase0_samples/
+
+# env / secrets
+.env
+*.pem
+
+# temp / scratch (Playwright MCP output, loose screenshots)
+.playwright-mcp/
+/shot*.png
+temp/

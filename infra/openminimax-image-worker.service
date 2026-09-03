@@ -1,0 +1,38 @@
+# GPU-box IMAGE worker (serverless path) — runs on the g6e.12xlarge alongside the
+# FLUX shim. Drains the shared DynamoDB task queue for kind=image ONLY, calls the
+# private FLUX shim (:30020, cuda:2), uploads the PNG(s) to the private result bucket,
+# writes the result back to DynamoDB. Runs in PARALLEL with the video worker (which
+# drains kind=video against H3 on cuda:0). See README §2.
+#
+# Account-specific values (RESULT_BUCKET, table names, region) come from
+# /etc/openminimax.env, which serving/bootstrap.sh generates at deploy time — so this
+# unit carries NO placeholders and is committed as-is. Install (bootstrap.sh does this):
+#   sudo cp infra/openminimax-image-worker.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now openminimax-image-worker
+[Unit]
+Description=openminimax GPU image worker (DynamoDB queue -> FLUX -> S3)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# root to match the serve/flux shims and read their root-owned /mnt/models outputs. The
+# GPU-box DLAMI is Ubuntu (no ec2-user); AWS creds come from the instance profile, not a
+# login user, so root is correct here.
+User=root
+WorkingDirectory=/opt/openminimax/gateway
+# Deploy-time env (RESULT_BUCKET, KEYS_TABLE, TASKS_TABLE, AWS_REGION) — written by
+# serving/bootstrap.sh from the serverless stack outputs. Kept out of the committed unit.
+EnvironmentFile=/etc/openminimax.env
+# Invariant, non-account-specific config (safe to commit):
+Environment=WORKER_KIND=image
+Environment=FLUX_URL=http://127.0.0.1:30020
+Environment=PRESIGN_TTL_S=3600
+Environment=WORKER_POLL_SECONDS=1
+# app.* is importable only from the DLAMI venv where diffusers/boto3 live — NOT system python3.
+ExecStart=/opt/pytorch/bin/python -m app.worker_main
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
